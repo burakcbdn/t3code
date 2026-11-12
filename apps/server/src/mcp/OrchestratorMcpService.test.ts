@@ -3046,11 +3046,37 @@ describe("OrchestratorMcpService provider resolution", () => {
       capabilities: new Set(["orchestration"]),
       issuedAt: 1,
     };
+    const codex: ServerProvider = {
+      ...providerSnapshot({
+        instanceId: codexInstanceId,
+        driver: ProviderDriverKind.make("codex"),
+      }),
+      supportedRuntimeModes: ["approval-required"],
+      models: ["gpt-5", "gpt-5-mini"].map((slug) => ({
+        slug,
+        name: slug,
+        isCustom: false,
+        capabilities: {
+          optionDescriptors: [
+            {
+              id: "reasoningEffort",
+              label: "Reasoning",
+              type: "select" as const,
+              options: [
+                { id: "low", label: "Low" },
+                { id: "high", label: "High" },
+              ],
+            },
+          ],
+        },
+      })),
+    };
     const service = (
       git: Partial<GitVcsDriver.GitVcsDriver["Service"]>,
       saved: Ref.Ref<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>,
       task: ScheduledTask = existing,
       modes?: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput["threadMode"]>>,
+      selections?: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput["modelSelection"]>>,
     ) =>
       OrchestratorMcpService.layer.pipe(
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
@@ -3061,12 +3087,11 @@ describe("OrchestratorMcpService provider resolution", () => {
             NodeCrypto.layer,
             Layer.mock(ThreadManagementService.ThreadManagementService)({
               getThreadShell: () => Effect.succeed(null),
+              isProviderInstanceEnabledForProject: () => Effect.succeed(true),
             }),
             ServerSettings.layerTest(),
-            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-              list: () => Effect.succeed([]),
-            }),
+            providerRegistryLayer([codex]),
+            adapterRegistryLayer([codexInstanceId]),
             Layer.mock(ProjectService.ProjectService)({
               getById: () =>
                 Effect.succeedSome({
@@ -3086,7 +3111,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                       ? Effect.void
                       : Ref.update(modes, (all) => [...all, input.threadMode]),
                   ),
-                  Effect.as({ task }),
+                  Effect.andThen(
+                    selections === undefined
+                      ? Effect.void
+                      : Ref.update(selections, (all) => [...all, input.modelSelection]),
+                  ),
+                  Effect.as({ task: { ...task, modelSelection: input.modelSelection } }),
                 ),
             }),
           ),
@@ -3110,6 +3140,51 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.deepEqual(yield* Ref.get(saved), [
           { type: "worktree", baseRef: "origin/master", startFromOrigin: true },
         ]);
+      }),
+    );
+
+    it.effect("sets the model and effort a task runs with, and reports them back", () =>
+      Effect.gen(function* () {
+        const selections = yield* Ref.make<
+          ReadonlyArray<ScheduledTaskUpsertInput["modelSelection"]>
+        >([]);
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(
+            service(
+              masterRepository,
+              yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]),
+              existing,
+              undefined,
+              selections,
+            ),
+          ),
+        );
+        const target = {
+          providerInstanceId: codexInstanceId,
+          model: "gpt-5-mini",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        };
+        const created = yield* mcp.scheduleTask(client, {
+          projectId,
+          prompt: "Check the build",
+          schedule,
+          bindToCurrentThread: false,
+          target,
+        } as Parameters<typeof mcp.scheduleTask>[1]);
+        const updated = yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: existing.id,
+          target,
+        } as Parameters<typeof mcp.updateScheduledTask>[1]);
+        const requested = {
+          instanceId: codexInstanceId,
+          model: target.model,
+          options: target.options,
+        };
+        assert.deepEqual(yield* Ref.get(selections), [requested, requested]);
+        for (const task of [created, updated]) {
+          assert.include(JSON.stringify(task), '"gpt-5-mini"');
+          assert.include(JSON.stringify(task), '"high"');
+        }
       }),
     );
 
