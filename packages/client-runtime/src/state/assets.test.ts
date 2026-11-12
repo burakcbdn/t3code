@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   type AssetCreateUrlResult,
   type AssetResource,
+  AssetWorkspaceAssetNotFoundError,
   EnvironmentId,
   ThreadId,
   WS_METHODS,
@@ -23,6 +24,7 @@ import {
 } from "../connection/model.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { resolveMediaSource } from "../mediaSource.ts";
 import type * as RpcSession from "../rpc/session.ts";
 import {
   ASSET_URL_MAX_IN_FLIGHT,
@@ -232,6 +234,93 @@ describe("asset URL requests", () => {
           yield* Queue.take(harness.started);
         }
         expect(harness.maxInFlight(remote)).toBe(ASSET_URL_MAX_IN_FLIGHT);
+      }),
+    ),
+  );
+});
+
+describe("desktop-local media fallback", () => {
+  it.effect("does not show this desktop's file for a relative image from a remote thread", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const remote = EnvironmentId.make("remote");
+        const local = EnvironmentId.make("local");
+        const calls: EnvironmentId[] = [];
+        const supervisors = new Map<
+          EnvironmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor["Service"]
+        >();
+        for (const environmentId of [remote, local]) {
+          const client = {
+            [WS_METHODS.assetsCreateUrl]: ({ resource }: { readonly resource: AssetResource }) => {
+              calls.push(environmentId);
+              return environmentId === remote
+                ? Effect.fail(new AssetWorkspaceAssetNotFoundError({ resource }))
+                : Effect.succeed({ relativeUrl: "/api/assets/local/report.png", expiresAt: 1 });
+            },
+          };
+          supervisors.set(
+            environmentId,
+            EnvironmentSupervisor.EnvironmentSupervisor.of({
+              target: new PrimaryConnectionTarget({
+                environmentId,
+                label: environmentId,
+                httpBaseUrl: `https://${environmentId}.test`,
+                wsBaseUrl: `wss://${environmentId}.test`,
+              }),
+              state: yield* SubscriptionRef.make<SupervisorConnectionState>({
+                ...AVAILABLE_CONNECTION_STATE,
+                desired: true,
+                network: "online",
+                phase: "connected",
+                attempt: 1,
+                generation: 1,
+              }),
+              session: yield* SubscriptionRef.make(
+                Option.some({ client } as unknown as RpcSession.RpcSession),
+              ),
+              prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+              connect: Effect.void,
+              disconnect: Effect.void,
+              retryNow: Effect.void,
+            }),
+          );
+        }
+        type Registry = EnvironmentRegistry.EnvironmentRegistry["Service"];
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor;
+        const run: Registry["run"] = (id, effect) =>
+          Effect.provideService(effect, supervisor, supervisors.get(id)!);
+        const followStream: Registry["followStream"] = (id, stream) =>
+          Stream.provideService(stream, supervisor, supervisors.get(id)!);
+        const environments = EnvironmentRegistry.EnvironmentRegistry.of({
+          run,
+          followStream,
+        } as unknown as Registry);
+        const registry = AtomRegistry.make();
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+        const assets = createAssetEnvironmentAtoms(
+          Atom.runtime(Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environments)),
+          Atom.make({ environmentId: local, httpBaseUrl: "https://local.test" }),
+        );
+        const media = resolveMediaSource("docs/report.png", {
+          threadId: ThreadId.make("remote-thread"),
+          workspaceRoot: "/tmp/t3-repro/repo",
+        });
+        if (media?.access !== "environment") throw new Error("expected an environment image");
+
+        const result = yield* Effect.result(
+          AtomRegistry.getResult(
+            registry,
+            assets.createUrl({ environmentId: remote, input: { resource: media.resource } }),
+            { suspendOnWaiting: true },
+          ),
+        );
+
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "AssetWorkspaceAssetNotFoundError" },
+        });
+        expect(calls).toEqual([remote]);
       }),
     ),
   );
