@@ -3254,6 +3254,93 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       }),
   );
 
+  it.effect("starts another thread's turn while every worker waits on a silent provider", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const key = "foundation-silent-provider-starts";
+      const silentThreadIds = Array.from({ length: 4 }, (_, index) =>
+        ThreadId.make(`thread:${key}:silent-${index}`),
+      );
+      const otherThreadId = ThreadId.make(`thread:${key}:other`);
+      const otherRunId = RunId.make(`run:${key}:other`);
+      const silentStarted = yield* Deferred.make<void>();
+      const otherStarted = yield* Deferred.make<void>();
+      let silentStartCount = 0;
+      yield* outbox.enqueue(
+        silentThreadIds.map((threadId, index) => ({
+          id: `effect:${key}:silent-${index}`,
+          commandId: CommandId.make(`command:${key}:silent-${index}`),
+          threadId,
+          request: {
+            type: "provider-turn.start" as const,
+            runId: RunId.make(`run:${key}:silent-${index}`),
+          },
+        })),
+      );
+
+      const layerExecutor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) =>
+            effect.request.type === "provider-turn.start" && effect.request.runId === otherRunId
+              ? Deferred.succeed(otherStarted, undefined)
+              : Effect.suspend(() => {
+                  silentStartCount += 1;
+                  return silentStartCount === silentThreadIds.length
+                    ? Deferred.succeed(silentStarted, undefined)
+                    : Effect.void;
+                }).pipe(Effect.andThen(Effect.never)),
+        }),
+      );
+      const layerWorker = EffectWorker.layerWithOptions({
+        workerId: "silent-provider-worker",
+      }).pipe(
+        Layer.provide(
+          Layer.merge(Layer.succeed(EffectOutbox.EffectOutboxV2, outbox), layerExecutor),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        yield* EffectWorker.runDaemon.pipe(Effect.forkScoped);
+        yield* Deferred.await(silentStarted);
+        yield* outbox.enqueue([
+          {
+            id: `effect:${key}:other`,
+            commandId: CommandId.make(`command:${key}:other`),
+            threadId: otherThreadId,
+            request: { type: "provider-turn.start", runId: otherRunId },
+          },
+        ]);
+        yield* outbox.notifyAvailable();
+
+        const other = yield* Deferred.await(otherStarted).pipe(
+          Effect.timeoutOption("1 hour"),
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust("1 hour");
+        assert.isTrue(
+          Option.isSome(yield* Fiber.join(other)),
+          "a turn on another thread never started while four starts waited on a silent provider",
+        );
+      }).pipe(
+        Effect.provide(layerWorker),
+        Effect.scoped,
+        Effect.ensuring(
+          Effect.forEach(
+            [...silentThreadIds, otherThreadId],
+            (threadId) =>
+              outbox.cancelUnsettled({
+                threadId,
+                effectTypes: ["provider-turn.start"],
+                reason: "fixture complete",
+              }),
+            { discard: true },
+          ).pipe(Effect.orDie),
+        ),
+      );
+    }),
+  );
+
   it.effect(
     "persists shutdown continuation intent through the real event sink without domain events",
     () =>
