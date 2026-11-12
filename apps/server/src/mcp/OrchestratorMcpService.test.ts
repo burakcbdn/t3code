@@ -3305,6 +3305,46 @@ describe("OrchestratorMcpService provider resolution", () => {
         ]);
       }),
     );
+
+    it.effect("runs in the project folder when the project is not a Git repository", () =>
+      Effect.gen(function* () {
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTask["workspaceStrategy"]>>([]);
+        const notARepository = (cwd: string) =>
+          Effect.fail(
+            new GitCommandError({
+              operation: "GitVcsDriver.test",
+              command: "git",
+              cwd,
+              detail: "fatal: not a git repository (or any of the parent directories): .git",
+              reason: "not_a_repository",
+            }),
+          );
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(
+            service(
+              {
+                execute: ({ cwd }) => notARepository(cwd),
+                resolvePrimaryRemoteName: notARepository,
+                resolveDefaultBranchName: (cwd) => notARepository(cwd),
+                resolveCommit: ({ cwd }) => notARepository(cwd),
+              },
+              saved,
+              {
+                ...existing,
+                threadId: ThreadId.make("thread:scheduled-base"),
+                threadMode: "continue",
+              },
+            ),
+          ),
+        );
+        yield* mcp.scheduleTask(client, { projectId, prompt: "Check the build", schedule });
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: existing.id,
+          bindToCurrentThread: false,
+        });
+        assert.deepEqual(yield* Ref.get(saved), [{ type: "root" }, { type: "root" }]);
+      }),
+    );
   });
   it.effect(
     "reports the child run's selection after a restart and the thread selection before launch",
