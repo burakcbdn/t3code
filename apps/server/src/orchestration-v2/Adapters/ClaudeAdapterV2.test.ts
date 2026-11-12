@@ -16168,11 +16168,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             uuid: "00000000-0000-4000-8000-000000000957",
             toolUseId: IDLE_BASH,
           }),
-          makeSubagentNotificationFrame({
-            taskId: TASK_ID,
-            toolUseId: TOOL_USE_ID,
-            summary: "Still auditing.",
-            uuid: "00000000-0000-4000-8000-000000000958",
+          claudeSdkFrame({
+            ...makeSubagentNotificationFrame({
+              taskId: TASK_ID,
+              toolUseId: TOOL_USE_ID,
+              summary: "Still auditing.",
+              uuid: "00000000-0000-4000-8000-000000000958",
+            }),
+            usage: { total_tokens: 21_922, tool_uses: 1, duration_ms: 5_226 },
           }),
         ]) {
           yield* Queue.offer(harness.sdkMessages, frame);
@@ -16221,6 +16224,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(
           finalSubagent?.type === "subagent.updated" && finalSubagent.subagent.status,
           "completed",
+        );
+        assert.deepEqual(
+          finalSubagent?.type === "subagent.updated" ? finalSubagent.subagent.usage : undefined,
+          { contextTokens: 21_922, toolUses: 1 },
         );
       }).pipe(
         Effect.provide(
