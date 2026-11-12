@@ -1183,6 +1183,21 @@ it("opens a known empty attachment even when its range response is inaccessible"
   );
 });
 
+it.each([
+  ["one.csv", "text/csv", "name\nAda\n", "1 row · 1 column ·"],
+  ["one.tsv", "text/tab-separated-values", "name\nAda\n", "1 row · 1 column ·"],
+  ["one.txt", "text/plain", `${"a".repeat(1024 * 1024)}\n`, "1 line ·"],
+])(
+  "uses singular count nouns for a single-item %s preview",
+  async (name, mimeType, text, label) => {
+    const file = new Blob([text], { type: mimeType });
+    await using screen = await render(
+      <AttachmentFilePreview name={name} mimeType={mimeType} sizeBytes={file.size} file={file} />,
+    );
+    await expect.element(screen.getByRole("status")).toHaveTextContent(label);
+  },
+);
+
 it.each(["draft", "thread"] as const)(
   "reads an unknown-size %s workspace file instead of treating it as empty",
   async (source) => {
