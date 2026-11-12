@@ -826,6 +826,25 @@ it.effect("a desktop page that loaded before the server attached reports its loa
   ).pipe(Effect.provide(layer)),
 );
 
+// Playwright's CDP attach emulates a light scheme, so a "system" tab must clear it.
+it.effect("a desktop tab left on the system appearance clears Playwright's light scheme", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker } = yield* ready;
+      desktopRendersNext = true;
+      yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { url: "https://example.com/", reuseExistingTab: false, show: false },
+      });
+
+      expect(desktopConnections[0]!.context.page.emulateMedia).toHaveBeenCalledWith({
+        colorScheme: null,
+      });
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it.live.each([
   { method: "goto" as const, message: { type: "navigate", url: "http://10.255.255.1/" } },
   { method: "goBack" as const, message: { type: "history", delta: -1 } },
