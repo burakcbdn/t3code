@@ -7883,6 +7883,93 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("tracks an existing native child resumed on a fresh adapter session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // A fresh harness stands in for a restarted server: the child was spawned by an
+        // earlier adapter session, so this one first hears of it through followupTask.
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "codex-existing-child-after-restart",
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId: RESUME_NATIVE_THREAD,
+                nativeTurnId: RESUME_NATIVE_TURN,
+                prompt: RESUME_PROMPT,
+              }),
+              {
+                type: "emit_inbound",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "subAgentActivity",
+                      id: "call-codex-followup-after-restart",
+                      kind: "interacted",
+                      agentThreadId: RESUME_CHILD_THREAD,
+                      agentPath: "/root/resume_agent",
+                    },
+                    threadId: RESUME_NATIVE_THREAD,
+                    turnId: RESUME_NATIVE_TURN,
+                    completedAtMs: 1782622441000,
+                  },
+                },
+              },
+              childTurnStarted(RESUME_CHILD_TURN_2),
+              childAgentMessage({
+                id: "child-answer-after-restart",
+                text: "CODEX_AFTER_RESTART",
+                turnId: RESUME_CHILD_TURN_2,
+                completedAtMs: 1782622480000,
+              }),
+              childTurnCompleted(RESUME_CHILD_TURN_2),
+              ...resumeSubagentTranscript.entries.filter(
+                (entry) =>
+                  entry.type === "emit_inbound" &&
+                  (entry.label === "item/completed/root-answer" ||
+                    entry.label === "turn/completed/root"),
+              ),
+            ],
+          }),
+        );
+
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-codex-after-restart"),
+            text: RESUME_PROMPT,
+          }),
+        );
+        yield* harness.awaitTerminal(1);
+
+        assert.isTrue(
+          harness.events.some(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.threadId !== harness.threadId &&
+              event.message.text === "CODEX_AFTER_RESTART",
+          ),
+          "the resumed child's reply must reach its thread",
+        );
+        assert.includeMembers(
+          harness.subagentUpdates().map((event) => event.subagent.status),
+          ["running", "completed"],
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   const lateChildPrefix = () => {
     const entries = resumeSubagentTranscript.entries;
     const labelIndex = (label: string) =>
