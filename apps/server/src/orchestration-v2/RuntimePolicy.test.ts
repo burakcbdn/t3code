@@ -1,3 +1,8 @@
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import { assert, it } from "@effect/vitest";
 import {
   type ManagedPolicySummary,
@@ -78,7 +83,7 @@ const providerInstanceFor = (instanceId: ProviderInstanceId) =>
     },
   }) as ProviderInstance;
 
-const layerWithPolicy = (policy?: ManagedPolicySummary) =>
+const layerWithPolicy = (policy?: ManagedPolicySummary, workspaceRoot = "/project-root") =>
   RuntimePolicy.layerFromProjectStore.pipe(
     Layer.provide(ServerSettings.layerTest({}, policy)),
     Layer.provide(
@@ -96,7 +101,7 @@ const layerWithPolicy = (policy?: ManagedPolicySummary) =>
           Effect.succeedSome({
             projectId,
             title: "Project",
-            workspaceRoot: "/project-root",
+            workspaceRoot,
             defaultModelSelection: null,
             defaultThreadEnvMode: null,
             autoPull: false,
@@ -187,3 +192,43 @@ it.layer(
     }),
   );
 });
+
+const repositoryWithWorktree = Effect.acquireRelease(
+  Effect.sync(() => {
+    const root = NodeFS.realpathSync(NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-cwd-")));
+    const repository = NodePath.join(root, "repo");
+    const worktree = NodePath.join(root, "worktree");
+    const git = (cwd: string, ...args: ReadonlyArray<string>) =>
+      NodeChildProcess.execFileSync(
+        "git",
+        ["-c", "user.name=t3", "-c", "user.email=t3@example.com", ...args],
+        {
+          cwd,
+          stdio: "ignore",
+        },
+      );
+    NodeFS.mkdirSync(NodePath.join(repository, "ios"), { recursive: true });
+    NodeFS.writeFileSync(NodePath.join(repository, "ios", "README.md"), "ios\n");
+    git(repository, "init", "-q", "-b", "main");
+    git(repository, "add", "-A");
+    git(repository, "commit", "-q", "-m", "init");
+    git(repository, "worktree", "add", "-q", "-b", "feature", worktree);
+    return { root, repository, worktree };
+  }),
+  ({ root }) => Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
+);
+
+it.effect("starts a worktree thread in the project's subdirectory of the checkout", () =>
+  Effect.gen(function* () {
+    const { repository, worktree } = yield* repositoryWithWorktree;
+    const resolved = yield* Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      return yield* policy.resolve({
+        thread: makeThread({ now, worktreePath: worktree }),
+        modelSelection,
+      });
+    }).pipe(Effect.provide(layerWithPolicy(undefined, NodePath.join(repository, "ios"))));
+    assert.equal(resolved.cwd, NodePath.join(worktree, "ios"));
+  }).pipe(Effect.scoped),
+);
