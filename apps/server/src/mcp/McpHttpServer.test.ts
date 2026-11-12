@@ -1459,6 +1459,91 @@ it.effect("lists pull request watch tools only to threads that are not delegated
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
+it.effect("lists preview and device tools only to threads granted those capabilities", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const scopeFor = (
+        token: string,
+        capabilities: ReadonlyArray<McpInvocationContext.McpCapability>,
+      ): McpInvocationContext.McpThreadInvocationScope => ({
+        environmentId,
+        requestNamespace: token,
+        thread: {
+          threadId: ThreadId.make(`thread-${token}`),
+          providerSessionId: token,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        },
+        client: undefined,
+        capabilities: new Set(capabilities),
+        issuedAt: 1,
+      });
+      const scopes = new Map([
+        ["offToken", scopeFor("offToken", ["orchestration", "worktree", "pull-requests"])],
+        ["onToken", scopeFor("onToken", ["orchestration", "preview", "device"])],
+      ]);
+      const serverLayer = McpHttpServer.layerMcpTransport(
+        Layer.mergeAll(McpHttpServer.layerPreviewToolkit, McpHttpServer.layerDeviceToolkit),
+      ).pipe(
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: (token) => Effect.succeed(scopes.get(token)),
+          }),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            McpToolAccessTestkit.liveThreadsLayer,
+            PreviewAutomationBroker.layer.pipe(Layer.provide(NodeCrypto.layer)),
+            Layer.mock(DeviceService.DeviceService)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" }),
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const listedTools = (token: string) =>
+        Effect.gen(function* () {
+          const headers = {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${token}`,
+          };
+          const initialize = yield* httpClient.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+              "application/json",
+            ),
+          });
+          const listed = yield* httpClient.post("/mcp", {
+            headers: {
+              ...headers,
+              "mcp-session-id": initialize.headers["mcp-session-id"]!,
+              "mcp-protocol-version": "2025-06-18",
+            },
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+              "application/json",
+            ),
+          });
+          const body = (yield* listed.json) as {
+            readonly result: { readonly tools: ReadonlyArray<{ readonly name: string }> };
+          };
+          return body.result.tools.map((tool) => tool.name);
+        });
+
+      const onTools = yield* listedTools("onToken");
+      expect(onTools).toEqual(expect.arrayContaining(["preview_status", "device_list"]));
+      const offTools = yield* listedTools("offToken");
+      expect(offTools.filter((name) => /^(preview|device)_/.test(name))).toEqual([]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
 it.effect(
   "narrows an OAuth client's modes to the T3-Mode-Limit it sends, and never widens them",
   () =>
